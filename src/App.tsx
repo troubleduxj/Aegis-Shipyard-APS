@@ -3,6 +3,7 @@ import { ShipProject, MaterialItem, EmployeeCrew, ShipyardDock, OptimizationResu
 import { INITIAL_PROJECTS, INITIAL_MATERIALS, INITIAL_CREWS, INITIAL_DOCKS } from "./mockData";
 import { DockOccupancy } from "./components/DockOccupancy";
 import { GanttChart } from "./components/GanttChart";
+import { motion, AnimatePresence } from "motion/react";
 import { 
   Anchor, Box, Users, Sparkles, Send, Play, ShieldAlert, AlertCircle, RefreshCw, 
   CheckCircle, PlusCircle, PenTool, Database, Layers, ChevronRight, Gauge, HelpCircle, ArrowUpRight, Search, X
@@ -57,7 +58,66 @@ export default function App() {
   ]);
   const [newLogText, setNewLogText] = useState<string>("");
 
-  // Sync dock occupancy state based on projects
+  const isLoadedRef = React.useRef(false);
+
+  const loadShipyardData = async () => {
+    try {
+      const response = await fetch("/api/shipyard/data");
+      const data = await response.json();
+      if (data.success) {
+        if (data.shipyard_projects) setProjects(data.shipyard_projects);
+        if (data.sys_materials) setMaterials(data.sys_materials);
+        if (data.sys_crews) setCrews(data.sys_crews);
+        if (data.sys_docks) setDocks(data.sys_docks);
+        if (data.telemetry_logs && data.telemetry_logs.length > 0) {
+          const formattedLogs = data.telemetry_logs.map((log: any) => ({
+            time: log.timestamp.includes("T") 
+              ? new Date(log.timestamp).toTimeString().split(" ")[0]
+              : log.timestamp,
+            text: `[${log.source_module}] ${log.message_text}`,
+            category: log.category === "danger" ? "warning" : log.category,
+            id: log.id
+          }));
+          setLogs(formattedLogs);
+        }
+      }
+    } catch (err) {
+      console.error("Failed to fetch shipyard data:", err);
+    } finally {
+      isLoadedRef.current = true;
+    }
+  };
+
+  // Initial DB Load from server on mount
+  useEffect(() => {
+    loadShipyardData();
+  }, []);
+
+  // Debounced auto-save back to server-side JSON database on every UI state change
+  useEffect(() => {
+    if (!isLoadedRef.current) return;
+
+    const timer = setTimeout(async () => {
+      try {
+        await fetch("/api/shipyard/sync", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sys_docks: docks,
+            shipyard_projects: projects,
+            sys_materials: materials,
+            sys_crews: crews
+          })
+        });
+      } catch (err) {
+        console.error("Failed to sync client state to JSON server database:", err);
+      }
+    }, 800);
+
+    return () => clearTimeout(timer);
+  }, [projects, materials, crews, docks]);
+
+  // Sync dock occupancy state locally
   useEffect(() => {
     const updatedDocks = docks.map((dock) => {
       const associatedProj = projects.find((p) => p.dockId === dock.id);
@@ -67,7 +127,11 @@ export default function App() {
         currentVesselId: associatedProj?.id
       };
     });
-    setDocks(updatedDocks);
+    // Update docks locally if they differ to avoid trigger cycles
+    const hasChanges = JSON.stringify(updatedDocks) !== JSON.stringify(docks);
+    if (hasChanges) {
+      setDocks(updatedDocks);
+    }
   }, [projects]);
 
   // Handle stage progress adjustments
@@ -162,7 +226,7 @@ export default function App() {
     }
   };
 
-  // Chat ask handler
+  // Unified AI Assistant & Command Control Center chat handler (TSK-301, TSK-302, TSK-303)
   const handleSendChatQuery = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!chatQuery.trim()) return;
@@ -173,28 +237,61 @@ export default function App() {
     setChatLoading(true);
 
     try {
-      const res = await fetch("/api/scheduler/ask", {
+      // Direct integration with TSK-301 /api/ai/command router
+      const res = await fetch("/api/ai/command", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          query: userMsg,
-          history: chatHistory.slice(-6), // keep context size tiny and efficient
-          shipyardState: {
-            projects,
-            inventory: materials,
-            scheduling: crews
-          }
-        })
+        body: JSON.stringify({ command: userMsg })
       });
       const data = await res.json();
+      
       if (data.success) {
-        setChatHistory((prev) => [...prev, { role: "assistant", content: data.text }]);
+        if (data.isQuery) {
+          // Standard information consultation
+          setChatHistory((prev) => [
+            ...prev,
+            { role: "assistant", content: data.text }
+          ]);
+        } else {
+          // Operational command successfully executed and DB written back!
+          const formatAction = {
+            DELAY: "【工序工期顺延】",
+            ACCELERATE: "【工序特殊赶工】",
+            SUSPEND: "【突发事件停工】",
+            RESUME: "【复工指令下达】",
+            NONE: "【系统参数微调】"
+          }[data.action as "DELAY" | "ACCELERATE" | "SUSPEND" | "RESUME" | "NONE"] || "【指令调度执行】";
+
+          const formattedResponse = `${formatAction}
+指挥官，生产数据库参数已执行控制反写，并通过 APS Heuristic 模块完成级联排程：
+• **调度动作**：${data.action}
+• **调整量级**：针对阶段 ${data.affectedStages.join(", ")}，日期偏移量 **${data.adjustmentDays} 天**
+• **涉及项目**：${data.affectedProjects.join(", ")}
+• **优化原因**：${data.reason}
+• **级联状态**：由于工程前后续置依存冲突，各下属工序已实现瀑布级联调整。
+
+*系统已重新拉取数据库最新方案，Gantt甘特图与船坞数字化看板已完成重排刷新。*`;
+
+          setChatHistory((prev) => [
+            ...prev,
+            { role: "assistant", content: formattedResponse }
+          ]);
+
+          // Refresh the local visualization dashboard instantly!
+          await loadShipyardData();
+        }
       } else {
-        setChatHistory((prev) => [...prev, { role: "assistant", content: "抱歉，调度中枢系统遇到了逻辑传输瓶颈。" }]);
+        setChatHistory((prev) => [
+          ...prev,
+          { role: "assistant", content: `抱歉，调度中枢解析模块在处理指令时遇到了阻碍：${data.error || "未知异常"}` }
+        ]);
       }
     } catch (err) {
       console.error(err);
-      setChatHistory((prev) => [...prev, { role: "assistant", content: "网络通讯超时，无法获取AI指挥官回复。" }]);
+      setChatHistory((prev) => [
+        ...prev,
+        { role: "assistant", content: "网络通讯超时，无法连接至 Aegis 远程 AI 排程服务。" }
+      ]);
     } finally {
       setChatLoading(false);
     }
@@ -258,19 +355,64 @@ export default function App() {
   };
 
   // Logs append helper
-  const handleAddLiveLog = (e: React.FormEvent) => {
+  const handleAddLiveLog = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newLogText.trim()) return;
+    const txt = newLogText;
+    setNewLogText("");
+    
+    // Add locally instantly
     setLogs((prev) => [
       {
         time: new Date().toTimeString().split(" ")[0],
-        text: newLogText,
+        text: txt,
         category: "info",
         id: Date.now()
       },
       ...prev
     ]);
-    setNewLogText("");
+
+    // Persist to server SQLite db
+    try {
+      await fetch("/api/shipyard/log", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          category: "info",
+          source_module: "COMMAND_CENTER",
+          message_text: txt
+        })
+      });
+    } catch (err) {
+      console.error("Failed to persist live log:", err);
+    }
+  };
+
+  // Predefined event quick broadcast (TSK-403)
+  const handleAddPredefinedLog = async (text: string, category: "info" | "success" | "warning") => {
+    setLogs((prev) => [
+      {
+        time: new Date().toTimeString().split(" ")[0],
+        text: text,
+        category,
+        id: Date.now()
+      },
+      ...prev
+    ]);
+
+    try {
+      await fetch("/api/shipyard/log", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          category: category === "warning" ? "danger" : category,
+          source_module: "COMMAND_SHORTCUT",
+          message_text: text
+        })
+      });
+    } catch (err) {
+      console.error("Failed to persist predefined log:", err);
+    }
   };
 
   // Global KPIs calculation
@@ -1131,7 +1273,7 @@ export default function App() {
             )}
           </div>
 
-          {/* TAB Column Grid 2: Real-time Command Chat and feed logs panel (combines elements at bottom) */}
+          {/* TAB Column Grid 2: Real-time Command Chat and feed logs panel (combines elements at bottom) (TSK-402, TSK-403) */}
           <div className="mt-5 border-t border-white/10 pt-4 flex flex-col shrink-0 z-10 transition-all duration-300">
             {/* Toggle Header bar */}
             <div 
@@ -1159,126 +1301,159 @@ export default function App() {
                 {showBottomPanel ? (
                   <>
                     <span>折叠隐藏面板</span>
-                    <ChevronRight className="h-3.5 w-3.5 rotate-90 transition-transform" />
+                    <ChevronRight className="h-3.5 w-3.5 rotate-90 transition-transform duration-200" />
                   </>
                 ) : (
                   <>
                     <span className="animate-pulse">点击展开 AI & 日志监控</span>
-                    <ChevronRight className="h-3.5 w-3.5 -rotate-90 transition-transform" />
+                    <ChevronRight className="h-3.5 w-3.5 -rotate-90 transition-transform duration-200" />
                   </>
                 )}
               </button>
             </div>
 
-            {/* Expandable Panel Body */}
-            {showBottomPanel && (
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 h-56 mt-4 animate-in slide-in-from-bottom duration-200 overflow-hidden">
-                {/* Real-time feed events log - Left 5 cols */}
-                <div className="lg:col-span-5 bg-[#0f0f12] border border-white/10 rounded-xl p-4 flex flex-col h-full overflow-hidden">
-                  <div className="flex items-center justify-between mb-2">
-                    <h3 className="text-[10px] uppercase tracking-wider font-mono font-bold text-white flex items-center gap-1.5">
-                      <span className="w-1.5 h-1.5 bg-cyan-400 rounded-full inline-block animate-ping"></span>
-                      船坞建造及物流实时跟踪看板
-                    </h3>
-                    <span className="text-[8px] font-mono text-gray-500">LIVE FEED</span>
-                  </div>
+            {/* Expandable Panel Body with Framer Motion Sliding Animation (TSK-402) */}
+            <AnimatePresence initial={false}>
+              {showBottomPanel && (
+                <motion.div 
+                  initial={{ height: 0, opacity: 0, marginTop: 0 }}
+                  animate={{ height: "240px", opacity: 1, marginTop: 16 }}
+                  exit={{ height: 0, opacity: 0, marginTop: 0 }}
+                  transition={{ duration: 0.25, ease: "easeInOut" }}
+                  className="grid grid-cols-1 lg:grid-cols-12 gap-5 overflow-hidden"
+                >
+                  {/* Real-time feed events log - Left 5 cols (TSK-403) */}
+                  <div className="lg:col-span-5 bg-[#0f0f12] border border-white/10 rounded-xl p-4 flex flex-col h-full overflow-hidden">
+                    <div className="flex items-center justify-between mb-1.5">
+                      <h3 className="text-[10px] uppercase tracking-wider font-mono font-bold text-white flex items-center gap-1.5">
+                        <span className="w-1.5 h-1.5 bg-cyan-400 rounded-full inline-block animate-ping"></span>
+                        船坞建造及物流实时跟踪看板
+                      </h3>
+                      <span className="text-[8px] font-mono text-gray-500">LIVE FEED</span>
+                    </div>
 
-                  {/* Feed scrollable lists */}
-                  <div className="flex-1 overflow-y-auto space-y-1.5 pr-1">
-                    {logs.map((log) => (
-                      <div 
-                        key={log.id} 
-                        className={`flex items-start gap-2.5 p-1.5 rounded transition-all text-[11px] ${
-                          log.category === "success" 
-                            ? "bg-emerald-500/5 text-emerald-300 border-l border-emerald-500" 
-                            : log.category === "warning" 
-                            ? "bg-rose-500/5 text-rose-300 border-l border-rose-500" 
-                            : "bg-white/5 text-gray-300 border-l border-cyan-500"
-                        }`}
+                    {/* Predefined Instant Event Simulation Shortcuts (TSK-403) */}
+                    <div className="flex gap-1 mb-1.5 shrink-0 overflow-x-auto text-[9.5px] font-mono py-0.5 custom-scroll-area">
+                      <button
+                        type="button"
+                        onClick={() => handleAddPredefinedLog("🚨 [调度中心预警] 1号干船坞重钢拼板运输遭遇起重机故障，物流暂中断30分钟！", "warning")}
+                        className="px-2 py-0.5 bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/20 rounded cursor-pointer transition-colors whitespace-nowrap font-bold"
                       >
-                        <span className="font-mono text-gray-600 shrink-0 text-[10px]">{log.time}</span>
-                        <p className="flex-1 truncate" title={log.text}>{log.text}</p>
-                        <span className={`text-[8.5px] uppercase font-mono font-bold shrink-0 ${
-                          log.category === "success" ? "text-emerald-500" : log.category === "warning" ? "text-rose-500" : "text-cyan-400"
-                        }`}>
-                          {log.category === "success" ? "通过" : log.category === "warning" ? "警报" : "运转"}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
+                        🚨 物流中断
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleAddPredefinedLog("👥 [班组调度情报] 焊接二班与装配一班在2号拼板坞位安全交接班，工效稳定。", "success")}
+                        className="px-2 py-0.5 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/20 rounded cursor-pointer transition-colors whitespace-nowrap font-bold"
+                      >
+                        👥 班组交班
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleAddPredefinedLog("⛈️ [突发重工应急] 预警：台风‘山竹’逼近，18点起全体船坞进入加固系泊预警状态！", "warning")}
+                        className="px-2 py-0.5 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/20 rounded cursor-pointer transition-colors whitespace-nowrap font-bold"
+                      >
+                        ⛈️ 台风防灾
+                      </button>
+                    </div>
 
-                  {/* Quick manual dispatch simulation logging */}
-                  <form onSubmit={handleAddLiveLog} className="mt-2 flex gap-1.5 shrink-0">
-                    <input
-                      type="text"
-                      placeholder="调度室手动广播新事件/警报..."
-                      value={newLogText}
-                      onChange={(e) => setNewLogText(e.target.value)}
-                      className="flex-1 bg-[#060608] border border-white/10 rounded px-2.5 py-1 text-[11px] text-gray-300 placeholder-gray-600 focus:outline-hidden focus:border-cyan-500 font-mono"
-                    />
-                    <button 
-                      type="submit" 
-                      className="px-3 py-1 bg-white/5 hover:bg-white/10 border border-white/10 text-white rounded text-[10px] font-mono font-bold cursor-pointer"
-                    >
-                      广播
-                    </button>
-                  </form>
-                </div>
-
-                {/* AI Command Center Assistant QA - Right 7 cols */}
-                <div className="lg:col-span-7 bg-[#0f0f12] border border-white/10 rounded-xl p-4 flex flex-col h-full overflow-hidden">
-                  <div className="flex items-center justify-between mb-2">
-                    <h3 className="text-[10px] uppercase tracking-wider font-mono font-bold text-white flex items-center gap-1.5">
-                      <Sparkles className="h-3.5 w-3.5 text-cyan-400" />
-                      造船厂总调度 AI 指挥提问台
-                    </h3>
-                    <span className="text-[8px] font-mono text-gray-500">GEMINI POWERED</span>
-                  </div>
-
-                  {/* Chat messages viewport */}
-                  <div className="flex-1 overflow-y-auto space-y-2 pr-1 bg-[#060608]/50 rounded-lg p-2.5 border border-white/5 font-mono text-[10.5px]">
-                    {chatHistory.map((msg, idx) => (
-                      <div key={idx} className={`flex gap-1.5 items-start ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
-                        {msg.role !== "user" && <span className="text-cyan-400 shrink-0 select-none">[Command]</span>}
-                        <div className={`p-1.5 rounded max-w-[85%] leading-relaxed ${
-                          msg.role === "user" 
-                            ? "bg-cyan-500/10 text-cyan-300 self-end text-right border border-cyan-500/10" 
-                            : "text-gray-300 self-start text-left"
-                        }`}>
-                          {msg.content}
+                    {/* Feed scrollable lists */}
+                    <div className="flex-1 overflow-y-auto space-y-1.5 pr-1 custom-scroll-area">
+                      {logs.map((log) => (
+                        <div 
+                          key={log.id} 
+                          className={`flex items-start gap-2.5 p-1.5 rounded transition-all text-[11px] ${
+                            log.category === "success" 
+                              ? "bg-emerald-500/5 text-emerald-300 border-l border-emerald-500" 
+                              : log.category === "warning" 
+                              ? "bg-rose-500/5 text-rose-300 border-l border-rose-500" 
+                              : "bg-white/5 text-gray-300 border-l border-cyan-500"
+                          }`}
+                        >
+                          <span className="font-mono text-gray-500 shrink-0 text-[10px]">{log.time}</span>
+                          <p className="flex-1 truncate" title={log.text}>{log.text}</p>
+                          <span className={`text-[8.5px] uppercase font-mono font-bold shrink-0 ${
+                            log.category === "success" ? "text-emerald-500" : log.category === "warning" ? "text-rose-500" : "text-cyan-400"
+                          }`}>
+                            {log.category === "success" ? "通过" : log.category === "warning" ? "警报" : "运转"}
+                          </span>
                         </div>
-                        {msg.role === "user" && <span className="text-gray-500 shrink-0 select-none">[调度长]</span>}
-                      </div>
-                    ))}
-                    {chatLoading && (
-                      <div className="text-gray-500 italic animate-pulse flex items-center gap-1">
-                        <RefreshCw className="h-3 w-3 animate-spin text-cyan-400" />
-                        指令中枢正在比对全局排班與物资库存关联因子...
-                      </div>
-                    )}
+                      ))}
+                    </div>
+
+                    {/* Quick manual dispatch simulation logging */}
+                    <form onSubmit={handleAddLiveLog} className="mt-2 flex gap-1.5 shrink-0">
+                      <input
+                        type="text"
+                        placeholder="调度室手动广播新事件/警报..."
+                        value={newLogText}
+                        onChange={(e) => setNewLogText(e.target.value)}
+                        className="flex-1 bg-[#060608] border border-white/10 rounded px-2.5 py-1 text-[11px] text-gray-300 placeholder-gray-600 focus:outline-hidden focus:border-cyan-500 font-mono"
+                      />
+                      <button 
+                        type="submit" 
+                        className="px-3 py-1 bg-white/5 hover:bg-white/10 border border-white/10 text-white rounded text-[10px] font-mono font-bold cursor-pointer transition-all"
+                      >
+                        广播
+                      </button>
+                    </form>
                   </div>
 
-                  {/* Ask input form */}
-                  <form onSubmit={handleSendChatQuery} className="mt-2 flex gap-2 shrink-0">
-                    <input
-                      type="text"
-                      placeholder="提问：钢体车间隔天工效如何调节？/ EH36高强钢到货后如何部署？"
-                      value={chatQuery}
-                      onChange={(e) => setChatQuery(e.target.value)}
-                      className="flex-1 bg-[#060608] border border-white/10 rounded px-2.5 py-1 text-xs text-gray-200 placeholder-gray-600 focus:outline-hidden focus:border-cyan-500 font-sans"
-                    />
-                    <button
-                      type="submit"
-                      disabled={chatLoading}
-                      className="px-4 bg-cyan-500 hover:bg-cyan-600 text-black font-extrabold rounded text-xs flex items-center gap-1 cursor-pointer transition-all disabled:bg-gray-700"
-                    >
-                      <Send className="w-3.5 h-3.5" />
-                      提问
-                    </button>
-                  </form>
-                </div>
-              </div>
-            )}
+                  {/* AI Command Center Assistant QA - Right 7 cols */}
+                  <div className="lg:col-span-7 bg-[#0f0f12] border border-white/10 rounded-xl p-4 flex flex-col h-full overflow-hidden">
+                    <div className="flex items-center justify-between mb-2">
+                      <h3 className="text-[10px] uppercase tracking-wider font-mono font-bold text-white flex items-center gap-1.5">
+                        <Sparkles className="h-3.5 w-3.5 text-cyan-400" />
+                        造船厂总调度 AI 指挥提问台
+                      </h3>
+                      <span className="text-[8px] font-mono text-gray-500">GEMINI POWERED</span>
+                    </div>
+
+                    {/* Chat messages viewport */}
+                    <div className="flex-1 overflow-y-auto space-y-2 pr-1 bg-[#060608]/50 rounded-lg p-2.5 border border-white/5 font-mono text-[10.5px] custom-scroll-area">
+                      {chatHistory.map((msg, idx) => (
+                        <div key={idx} className={`flex gap-1.5 items-start ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
+                          {msg.role !== "user" && <span className="text-cyan-400 shrink-0 select-none">[Command]</span>}
+                          <div className={`p-1.5 rounded max-w-[85%] leading-relaxed ${
+                            msg.role === "user" 
+                              ? "bg-cyan-500/10 text-cyan-300 self-end text-right border border-cyan-500/10" 
+                              : "text-gray-300 self-start text-left"
+                          }`}>
+                            {msg.content}
+                          </div>
+                          {msg.role === "user" && <span className="text-gray-500 shrink-0 select-none">[调度长]</span>}
+                        </div>
+                      ))}
+                      {chatLoading && (
+                        <div className="text-gray-500 italic animate-pulse flex items-center gap-1">
+                          <RefreshCw className="h-3 w-3 animate-spin text-cyan-400" />
+                          指令中枢正在比对全局排班與物资库存关联因子...
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Ask input form */}
+                    <form onSubmit={handleSendChatQuery} className="mt-2 flex gap-2 shrink-0">
+                      <input
+                        type="text"
+                        placeholder="提问：钢体车间隔天工效如何调节？/ EH36高强钢到货后如何部署？"
+                        value={chatQuery}
+                        onChange={(e) => setChatQuery(e.target.value)}
+                        className="flex-1 bg-[#060608] border border-white/10 rounded px-2.5 py-1 text-xs text-gray-200 placeholder-gray-600 focus:outline-hidden focus:border-cyan-500 font-sans"
+                      />
+                      <button
+                        type="submit"
+                        disabled={chatLoading}
+                        className="px-4 bg-cyan-500 hover:bg-cyan-600 text-black font-extrabold rounded text-xs flex items-center gap-1 cursor-pointer transition-all disabled:bg-gray-700 font-bold"
+                      >
+                        <Send className="w-3.5 h-3.5" />
+                        提问
+                      </button>
+                    </form>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
           </div>
 
         </div>

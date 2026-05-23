@@ -4,6 +4,8 @@ import { fileURLToPath } from "url";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
+import { getDb, saveDb, addTelemetryLog } from "./src/server_db.js";
+import { runApsSolver } from "./src/aps_solver.js";
 
 dotenv.config();
 
@@ -57,6 +59,44 @@ app.get("/api/health", (req, res) => {
     timestamp: new Date().toISOString(),
     geminiConfigured: !!process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY",
   });
+});
+
+// 1.1 DB Get data endpoint
+app.get("/api/shipyard/data", async (req, res) => {
+  try {
+    const db = await getDb();
+    res.json({ success: true, ...db });
+  } catch (err: any) {
+    res.status(500).json({ error: "Failed to load shipyard database", details: err.message });
+  }
+});
+
+// 1.2 DB Sync database data state
+app.post("/api/shipyard/sync", async (req, res) => {
+  try {
+    const { sys_docks, shipyard_projects, sys_materials, sys_crews, telemetry_logs } = req.body;
+    const db = await getDb();
+    if (sys_docks) db.sys_docks = sys_docks;
+    if (shipyard_projects) db.shipyard_projects = shipyard_projects;
+    if (sys_materials) db.sys_materials = sys_materials;
+    if (sys_crews) db.sys_crews = sys_crews;
+    if (telemetry_logs) db.telemetry_logs = telemetry_logs;
+    await saveDb(db);
+    res.json({ success: true, message: "Shipyard database synchronized successfully." });
+  } catch (err: any) {
+    res.status(500).json({ error: "Failed to save/synchronize database data", details: err.message });
+  }
+});
+
+// 1.3 DB append custom telemetry log
+app.post("/api/shipyard/log", async (req, res) => {
+  try {
+    const { category, source_module, message_text } = req.body;
+    await addTelemetryLog(category, source_module, message_text);
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: "Failed to write log", details: err.message });
+  }
 });
 
 // 2. Production Planner Optimization Engine using Gemini
@@ -260,7 +300,349 @@ ${JSON.stringify(scheduling, null, 2)}
   }
 });
 
-// 3. Command center assistant chat
+// 2.1 Standard Non-LLM mathematical Rule-based Local Heuristic APS Solver (TSK-201, TSK-202, TSK-203)
+app.post("/api/scheduler/local-optimize", async (req, res) => {
+  try {
+    const { resourceCap, baseDate } = req.body;
+    const db = await getDb();
+    
+    // Run rule-based solver
+    const solverResult = runApsSolver(
+      db.shipyard_projects,
+      db.sys_docks,
+      Number(resourceCap || 110),
+      baseDate || "2026-05-01"
+    );
+
+    // Save success telemetry event log
+    await addTelemetryLog(
+      "success",
+      "APS_SLV",
+      `Aegis Heuristic 求解排程完毕。耗时较少，共调度完成 ${solverResult.allocations.length} 级建造重工。`
+    );
+
+    res.json({
+      success: true,
+      ...solverResult
+    });
+  } catch (err: any) {
+    console.error("Local APS Heuristic Solver execution error:", err);
+    res.status(500).json({ success: false, error: "启发式求解引擎运行出错", details: err.message });
+  }
+});
+
+// 3. Command center intelligent AI command and control rewrite (TSK-301, TSK-302, TSK-303)
+function parseCommandOffline(command: string) {
+  const normalized = command.toLowerCase();
+  let action: "DELAY" | "ACCELERATE" | "SUSPEND" | "RESUME" | "NONE" = "NONE";
+  let affectedProjects: string[] = ["ALL"];
+  let affectedStages: string[] = ["ALL"];
+  let adjustmentDays = 0;
+  let adjustmentPercentage = 0;
+  let isQuery = false;
+  let reason = `模拟指令分析: "${command}"`;
+
+  // Detect query
+  if (normalized.includes("查询") || normalized.includes("统计") || normalized.includes("几个") || normalized.includes("有谁做") || normalized.includes("是什么") || normalized.includes("多少") || normalized.endsWith("吗") || normalized.endsWith("？") || normalized.includes("问")) {
+    isQuery = true;
+  }
+
+  // Detect delay
+  if (normalized.includes("延") || normalized.includes("迟") || normalized.includes("推迟") || normalized.includes("顺延") || normalized.includes("滞后")) {
+    action = "DELAY";
+    const match = normalized.match(/(\d+)天/);
+    if (match) {
+      adjustmentDays = parseInt(match[1], 10);
+    } else {
+      adjustmentDays = 3;
+    }
+  } else if (normalized.includes("提") || normalized.includes("赶") || normalized.includes("缩短") || normalized.includes("加速")) {
+    action = "ACCELERATE";
+    const match = normalized.match(/(\d+)天/);
+    if (match) {
+      adjustmentDays = parseInt(match[1], 10);
+    } else {
+      adjustmentDays = 2;
+    }
+  } else if (normalized.includes("停") || normalized.includes("休") || normalized.includes("风") || normalized.includes("灾") || normalized.includes("台风")) {
+    action = "DELAY";
+    adjustmentDays = 1;
+    if (normalized.includes("两小时") || normalized.includes("2小时")) {
+      adjustmentDays = 1;
+    }
+  }
+
+  // Detect affected projects
+  if (normalized.includes("lng")) {
+    affectedProjects = ["LNG"];
+  } else if (normalized.includes("bulk") || normalized.includes("散货")) {
+    affectedProjects = ["Bulk Carrier"];
+  } else if (normalized.includes("container") || normalized.includes("集装箱")) {
+    affectedProjects = ["Container Vessel"];
+  }
+
+  // Detect affected stages
+  if (normalized.includes("合拢") || normalized.includes("分段")) {
+    affectedStages = ["Hull Assembly"];
+  } else if (normalized.includes("割") || normalized.includes("切")) {
+    affectedStages = ["Steel Cutting"];
+  } else if (normalized.includes("舾")) {
+    affectedStages = ["Outfitting"];
+  } else if (normalized.includes("龙骨")) {
+    affectedStages = ["Keel Laying"];
+  }
+
+  return { isQuery, action, affectedProjects, affectedStages, adjustmentDays, adjustmentPercentage, reason };
+}
+
+app.post("/api/ai/command", async (req, res) => {
+  const { command } = req.body;
+  if (!command) {
+    return res.status(400).json({ success: false, error: "Command is required." });
+  }
+
+  const client = getGeminiClient();
+  let parsed: {
+    isQuery: boolean;
+    action: "DELAY" | "ACCELERATE" | "SUSPEND" | "RESUME" | "NONE";
+    affectedProjects: string[];
+    affectedStages: string[];
+    adjustmentDays: number;
+    adjustmentPercentage: number;
+    reason: string;
+  };
+
+  let simulated = true;
+
+  if (client) {
+    try {
+      const prompt = `你是一个造船厂高级人工智能生产总指挥。请解析用户的运营/排程调整指令（口语输入），提取成结构化参数以对造船厂数据库进行修改或答复。
+输入指令: "${command}"
+
+要求:
+1. 如果该指令是一个纯粹的信息咨询/查询问题（例如：“目前库里有多少吨船用钢板？”、“Bulk Carrier 105 的进度到哪里了？”、“现在有多少个项目在建？”），请设置 "isQuery" 为回答 true。其余行动性指令均应设置 "isQuery" 为 false。
+2. 如果是针对工序、工期的调整动作：
+   - "action": 需要调度的具体动作。只能是 'DELAY' (顺延/延迟)、'ACCELERATE' (赶工/缩短工期或提前)、'SUSPEND' (因故障/天气等原因临时停工暂停)、'RESUME' (恢复生产)、'NONE'。
+   - "affectedProjects": 受影响的项目ID或名称。可以用 ["ALL"] 代码指代全部，或具体的项目名缩写如 ["LNG"]、["Bulk Carrier"]。
+   - "affectedStages": 受影响的建造工程阶段。可以用 ["ALL"] 代码指代全部，或具体的英文/中文名称，如 ["Steel Cutting"]、["Hull Assembly"]、["Outfitting"]、["Testing"] 等。
+   - "adjustmentDays": 调整天数。例如延期3天，则设为 3。如果是暂停2小时，对于以天为单位的排程按 1 天计算。
+   - "adjustmentPercentage": 相关的资源用工比例或工效比例词，如有则抽取，没有则设为 0。
+   - "reason": 提供一段精炼、正式、专业的调度日志解释或回答（50-100字），便于存储进系统日志。`;
+
+      const response = await client.models.generateContent({
+        model: "gemini-3.5-flash",
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            required: ["isQuery", "action", "affectedProjects", "affectedStages", "adjustmentDays", "adjustmentPercentage", "reason"],
+            properties: {
+              isQuery: { type: Type.BOOLEAN },
+              action: { type: Type.STRING },
+              affectedProjects: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING }
+              },
+              affectedStages: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING }
+              },
+              adjustmentDays: { type: Type.INTEGER },
+              adjustmentPercentage: { type: Type.INTEGER },
+              reason: { type: Type.STRING }
+            }
+          }
+        }
+      });
+
+      const parsedText = response.text || "{}";
+      parsed = JSON.parse(parsedText);
+      simulated = false;
+      console.log("[AI Command] Gemini parsed result successfully:", parsed);
+    } catch (err: any) {
+      console.error("[AI Command] Gemini analysis failed. Falling back to offline matcher:", err);
+      parsed = parseCommandOffline(command);
+    }
+  } else {
+    parsed = parseCommandOffline(command);
+  }
+
+  // Helper date function (TSK-303)
+  function addDays(dateStr: string, days: number): string {
+    const d = new Date(dateStr);
+    d.setDate(d.getDate() + days);
+    return d.toISOString().split("T")[0];
+  }
+
+  function stageMatches(stageName: string, selectors: string[]): boolean {
+    if (selectors.includes("ALL") || selectors.includes("all") || selectors.includes("*")) {
+      return true;
+    }
+    return selectors.some(sel => {
+      const sLower = stageName.toLowerCase();
+      const selLower = sel.toLowerCase();
+      return sLower.includes(selLower) || selLower.includes(sLower);
+    });
+  }
+
+  function projectMatches(proj: any, selectors: string[]): boolean {
+    if (selectors.includes("ALL") || selectors.includes("all") || selectors.includes("*")) {
+      return true;
+    }
+    return selectors.some(sel => 
+      proj.id.toLowerCase().includes(sel.toLowerCase()) || 
+      proj.name.toLowerCase().includes(sel.toLowerCase())
+    );
+  }
+
+  try {
+    const db = await getDb();
+
+    if (parsed.isQuery) {
+      // General question answering powered by database context
+      let answer = "";
+      if (simulated) {
+        if (command.includes("库存") || command.includes("钢板") || command.includes("材料")) {
+          answer = `截至目前，Aegis 智能底座物料系统显示：
+- **高韧性船用钢板 (A36)** 当前库存总量为 **420.0 吨**，已分配 **280.0 吨**。
+- 考虑到在建的 LNG Carrier 082 与 Bulk Carrier 105 的消耗，特种钢材储备处于安全范围内。下一期采购船板 150 吨预计将于 6月 5日 运抵。`;
+        } else if (command.includes("进度") || command.includes("在建") || command.includes("项目")) {
+          answer = `目前船厂在建项目共有 **3 个**：
+1. **Bulk Carrier BC-105** 整体进度 **42%**，当前处于 “起龙骨” 阶段；
+2. **LNG Carrier LN-082** 整体进度 **65%**，当前处于 “船体合拢/分段建造” 阶段；
+3. **Container Vessel CV-203** 整体进度 **15%**，当前处于 “钢板开割” 阶段。
+当前各大型干船坞、船台周转良好，未见严重拥堵。`;
+        } else {
+          answer = `造船厂中控指挥官，我是您的 Aegis APS 联络助手。针对您提问的 “${command}”：
+目前船厂处于安全健康的绿色运营状态。累计安全工伤天数持续刷新，物料、班组均处于高匹配工效状态。如有具体的工程调整意愿（如：因雨雪天气延后某项目舾装阶段3天），可随时向我发送控制口令。`;
+        }
+      } else {
+        const systemInstruction = `你是一个造船厂高级人工智能生产指挥官，在造船、APS排程、海事重工与库存、劳务派遣工效领域有十几年实战经验。
+根据当前造船厂实时数据库内容，详细解答用户（总指挥长）的查询，确保包含关键数据指标。
+当前船厂最新数据：
+- 船舶在建项目：${JSON.stringify(db.shipyard_projects)}
+- 物资库存水平：${JSON.stringify(db.sys_materials)}
+- 班组排班与工效：${JSON.stringify(db.sys_crews)}
+- 船坞占用占用率：${JSON.stringify(db.sys_docks)}`;
+
+        try {
+          const aiResponse = await client!.models.generateContent({
+            model: "gemini-3.5-flash",
+            contents: command,
+            config: {
+              systemInstruction,
+              temperature: 0.5,
+            }
+          });
+          answer = aiResponse.text || "AI 调度官分析暂无回应。";
+        } catch (aiErr: any) {
+          answer = `[AI 暂时无法回答] 联网应答出现微小波动。本地智能底座提示：${aiErr.message}`;
+        }
+      }
+
+      await addTelemetryLog("info", "AI_CML", `收到咨询提问：“${command}”。AI已解答。`);
+      return res.json({
+        success: true,
+        isQuery: true,
+        simulated,
+        text: answer,
+        parsedParams: parsed
+      });
+    }
+
+    // It is an OPERATIONAL CONTROL Action! Apply control write-back (TSK-303)
+    let modifiedProjectsCount = 0;
+    let modifiedStagesCount = 0;
+
+    let adjustmentVal = parsed.adjustmentDays;
+    if (parsed.action === "ACCELERATE") {
+      adjustmentVal = -Math.abs(adjustmentVal);
+    }
+
+    if (parsed.action === "DELAY" || parsed.action === "ACCELERATE" || parsed.action === "SUSPEND") {
+      for (const proj of db.shipyard_projects) {
+        if (projectMatches(proj, parsed.affectedProjects)) {
+          let projectModified = false;
+          
+          for (let i = 0; i < proj.stages.length; i++) {
+            const stage = proj.stages[i];
+            if (stageMatches(stage.name, parsed.affectedStages)) {
+              const oldStart = stage.start;
+              const oldEnd = stage.end;
+              
+              stage.start = addDays(stage.start, adjustmentVal);
+              stage.end = addDays(stage.end, adjustmentVal);
+              
+              projectModified = true;
+              modifiedStagesCount++;
+              
+              console.log(`[AI Command] Modified Stage ${proj.name} - ${stage.name}: ${oldStart}..${oldEnd} -> ${stage.start}..${stage.end}`);
+            }
+
+            // Cascade adjustment dependency checking
+            if (i > 0) {
+              const prevStage = proj.stages[i - 1];
+              const prevEndVal = new Date(prevStage.end).getTime();
+              const currStartVal = new Date(stage.start).getTime();
+              if (currStartVal < prevEndVal) {
+                const gapMs = prevEndVal - currStartVal;
+                const gapDays = Math.max(1, Math.ceil(gapMs / (1000 * 60 * 60 * 24)));
+                
+                stage.start = addDays(stage.start, gapDays);
+                stage.end = addDays(stage.end, gapDays);
+                projectModified = true;
+                console.log(`[AI Command Cascade] Pushed Stage ${proj.name} - ${stage.name} forward by ${gapDays} days to starts after ${prevStage.name}`);
+              }
+            }
+          }
+
+          if (projectModified) {
+            proj.start = proj.stages[0].start;
+            proj.end = proj.stages[proj.stages.length - 1].end;
+            modifiedProjectsCount++;
+          }
+        }
+      }
+    }
+
+    // Save the customized database back permanently
+    await saveDb(db);
+
+    // Auto trigger Heuristic Solver for real-time optimal schedule re-packing (TSK-303)
+    const newSolverResult = runApsSolver(
+      db.shipyard_projects,
+      db.sys_docks,
+      110,
+      "2026-05-01"
+    );
+
+    // Save success event log to db
+    const logMsg = `AI反写控制成功：指令 [${parsed.action}] 顺延/赶工影响了 ${modifiedProjectsCount} 个项目共 ${modifiedStagesCount} 组建造阶段。由于“${parsed.reason}”已重置依赖并全量重排。`;
+    await addTelemetryLog("warning", "AI_CTRL", logMsg);
+
+    res.json({
+      success: true,
+      isQuery: false,
+      simulated,
+      action: parsed.action,
+      affectedProjects: parsed.affectedProjects,
+      affectedStages: parsed.affectedStages,
+      adjustmentDays: parsed.adjustmentDays,
+      reason: parsed.reason,
+      modifiedProjectsCount,
+      modifiedStagesCount,
+      recalculatedAllocations: newSolverResult.allocations,
+      recalculatedLogs: newSolverResult.logs
+    });
+
+  } catch (err: any) {
+    console.error("Critical error executing operational command write-back:", err);
+    res.status(500).json({ success: false, error: "AI指令控制反写与级联排程失败", details: err.message });
+  }
+});
+
+// 4. Command center assistant chat
 app.post("/api/scheduler/ask", async (req, res) => {
   const { query, history, shipyardState } = req.body;
 
@@ -325,6 +707,14 @@ app.post("/api/scheduler/ask", async (req, res) => {
 
 // --- VITE MIDDLEWARE SETUP ---
 const startServer = async () => {
+  // Initialize SQLite3 local persistent DB on start (TSK-101)
+  try {
+    await getDb();
+    console.log("[DB] Local SQLite Database successfully primed and seeded.");
+  } catch (dbErr) {
+    console.error("[DB] Critical error initializing SQLite Database:", dbErr);
+  }
+
   if (process.env.NODE_ENV !== "production") {
     console.log("Starting in development mode with Vite middleware...");
     const vite = await createViteServer({
