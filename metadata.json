@@ -1,0 +1,6 @@
+{
+  "name": "Shipyard Management System",
+  "description": "An Advanced Planning and Scheduling (APS) shipyard system for monitoring production progress, material inventory, and employee scheduling efficiency.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
